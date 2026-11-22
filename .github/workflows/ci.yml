@@ -1,0 +1,68 @@
+# Copyright 2022 Mehmet ERGULCU
+# SPDX-License-Identifier: Apache-2.0
+
+# Test on every push and pull request; the PostgreSQL tests start a container.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: gofmt, vet, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "Run gofmt -w on:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - name: Test (the PostgreSQL tests use the Docker of the runner)
+        run: go test -race ./...
+      - name: Build for Linux, Windows and macOS
+        run: |
+          for target in linux/amd64 linux/arm64 windows/amd64 darwin/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 go build -o /dev/null ./cmd/...
+          done
+      - name: License headers
+        run: |
+          missing=$(git ls-files '*.go' '*.yml' '*.yaml' '*.sql' '*.html' 'Dockerfile' | xargs -r grep -L 'SPDX-License-Identifier' || true)
+          if [ -n "$missing" ]; then
+            echo "These files have no license header:"
+            echo "$missing"
+            exit 1
+          fi
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start against PostgreSQL
+        run: docker compose up -d --build --wait postgres bitmeet
+      - name: Create a meeting and read it back
+        run: |
+          for i in $(seq 1 30); do curl -sf localhost:8088/healthz && break; sleep 1; done
+          curl -sf -X POST localhost:8088/meetings -H 'Content-Type: application/json' -d '{
+            "planner": "ali@example.com", "subject": "Sprint planning",
+            "beginDate": "10-03-2026 14:00", "endDate": "10-03-2026 15:00"}'
+          curl -sf localhost:8088/meetings/ali@example.com | grep -q '"subject":"Sprint planning"'
+      - if: failure()
+        run: docker compose logs bitmeet
+      - if: always()
+        run: docker compose down -v
